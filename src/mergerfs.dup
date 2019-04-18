@@ -23,6 +23,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 
 
 _libc = ctypes.CDLL("libc.so.6",use_errno=True)
@@ -74,6 +75,7 @@ def mergerfs_branches(ctrlfile):
 
 
 def match(filename,matches):
+    # print(filename, matches)
     for match in matches:
         if fnmatch.fnmatch(filename,match):
             return True
@@ -92,10 +94,21 @@ def print_args(args):
 def build_copy_file(src,tgt,rel):
     srcpath = os.path.join(src,'./',rel)
     tgtpath = tgt + '/'
+    try:
+        src_stat = os.stat(srcpath)
+        tgt_stat = os.stat(os.path.join(tgtpath, rel))
+        # print('{} src size: {} src mtime: {} / {} tgt size: {} tgt mtime: {}'.format(srcpath, src_stat.st_size, src_stat.st_mtime, tgtpath, tgt_stat.st_size, tgt_stat.st_mtime))
+        # time.sleep(0.5)
+        if (src_stat.st_size == tgt_stat.st_size) \
+                and (src_stat.st_mtime == tgt_stat.st_mtime):
+            return []
+    except:
+        pass
     return ['rsync',
-            '-avHAXWE',
+            '-aHAXWES',
+            #'-avHAXWES',
             '--numeric-ids',
-            '--progress',
+            #'--progress',
             '--relative',
             srcpath,
             tgtpath]
@@ -138,6 +151,7 @@ optional arguments:
                          Can be used multiple times.
   -E, --exclude=         fnmatch compatible filter to exclude files.
                          Can be used multiple times.
+  -v, --verbose          Verbose logging
 '''
     print(help)
 
@@ -174,6 +188,9 @@ def buildargparser():
                         action='append',
                         default=[])
     parser.add_argument('-h','--help',
+                        action='store_true')
+    parser.add_argument('-v','--verbose',
+                        dest='verbose',
                         action='store_true')
 
     return parser
@@ -320,8 +337,10 @@ def main():
         print("%s is not a mergerfs mount" % args.dir)
         sys.exit(1)
 
+    bdir      = args.dir
     prune     = args.prune
     execute   = args.execute
+    verbose   = args.verbose
     includes  = ['*'] if not args.include else args.include
     excludes  = args.exclude
     dupfun    = getdupfun(args.dup)
@@ -329,18 +348,35 @@ def main():
     branches  = mergerfs_branches(ctrlfile)
     branches  = build_branches_freespace(branches)
     count     = min(args.count,len(branches))
+    if verbose:
+        print(args)
+    stats = {'overwrite': 0, 'copy': 0, 'remove': 0, 'skipped-errors': 0, 'skipped-excluded': 0}
+
+    print('{}: ensuring {} copies'.format(bdir, count))
 
     try:
         for (dirpath,dirnames,filenames) in os.walk(args.dir):
             for filename in filenames:
-                if match(filename,excludes):
+                fullpath = os.path.join(dirpath,filename)
+                #if match(filename,excludes):
+                if match(fullpath, excludes):
+                    if verbose:
+                        print('# skipping excluded file: {}'.format(fullpath))
+                    stats['skipped-excluded'] += 1
                     continue
-                if not match(filename,includes):
+                if not match(fullpath,includes):
+                    if verbose:
+                        print('# skipping file not included: {}'.format(fullpath))
+                    stats['skipped-excluded'] += 1
                     continue
 
-                fullpath = os.path.join(dirpath,filename)
                 basepath = mergerfs_basepath(fullpath)
                 relpath  = mergerfs_relpath(fullpath)
+                if relpath is None:
+                    if verbose:
+                        print('# WARNING: skipping {}, could not determine relpath'.format(fullpath))
+                    stats['skipped-errors'] += 1
+                    continue
                 existing = mergerfs_all_basepaths(fullpath,relpath)
 
                 srcpath  = dupfun(basepath,relpath,existing)
@@ -355,10 +391,11 @@ def main():
                         break
                     copies.append(tgtpath)
                     args = build_copy_file(srcpath,tgtpath,relpath)
-                    print('# overwrite')
-                    print_args(args)
-                    if execute:
+                    #print('# overwrite')
+                    #print_args(args)
+                    if execute and len(args) > 0:
                         execute_cmd(args)
+                    stats['overwrite'] += 1
                     i += 1
 
                 for _ in range(i,count):
@@ -369,10 +406,11 @@ def main():
                         copies.append(branch)
                         branches[branch] -= srcfile_size
                         args = build_copy_file(srcpath,branch,relpath)
-                        print('# copy')
-                        print_args(args)
+                        # print('# copy')
+                        #print_args(args)
                         if execute:
                             execute_cmd(args)
+                        stats['copy'] += 1
                         break
 
                 if prune:
@@ -385,7 +423,10 @@ def main():
                         print_args(args)
                         if execute:
                             execute_cmd(args)
+                        stats['remove'] += 1
 
+
+        print('{}: {}'.format(bdir, str(stats)))
 
     except KeyboardInterrupt:
         print("exiting: CTRL-C pressed")
